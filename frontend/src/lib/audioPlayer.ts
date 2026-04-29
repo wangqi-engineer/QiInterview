@@ -226,6 +226,76 @@ export class StreamingAudioPlayer {
     }
   }
 
+  /** 等 <audio> 真的把 SourceBuffer 里已缓冲的 mp3 播完。
+   *
+   * 之所以需要这个方法：``ai_audio_end`` 只代表后端已把所有 mp3 chunk 推完，
+   * 此时前端 SourceBuffer 里还有几秒音频没播。原先 ``InterviewPage`` 收到
+   * ``ai_audio_end`` 后 200 ms 就调 ``reset()`` 硬停 ``<audio>``，导致开场白/
+   * next_question 这种较长文本被截断。改为：收 ``ai_audio_end`` 后调
+   * ``endOfStream()`` 封口 MSE，再等本方法 resolve（``<audio>`` 自然触发
+   * ``ended`` 事件或被 ``cancel()``/``pause()`` 外部打断），然后才 reset。
+   *
+   * 返回值：
+   *   - "ended"     —— ``<audio>`` 自然播放完成（期望路径）
+   *   - "cancelled" —— 被外部 ``cancel()``/``pause()`` 中止（打断场景）
+   *   - "timeout"   —— 兜底超时，防止 MSE 在极端情况下永不触发 ``ended``
+   */
+  async waitUntilEnded(timeoutMs = 30_000): Promise<"ended" | "cancelled" | "timeout"> {
+    // 已经处于 ended 状态（比如 reset 前就播完了）直接返回。
+    if (!this.audio) return "ended";
+    if (this.audio.ended) return "ended";
+    return new Promise((resolve) => {
+      let settled = false;
+      const cleanup = () => {
+        settled = true;
+        this.audio.removeEventListener("ended", onEnded);
+        this.audio.removeEventListener("pause", onPause);
+        clearTimeout(timer);
+      };
+      const onEnded = () => {
+        if (settled) return;
+        // #region agent log
+        _apdbg("audioPlayer.ts:waitUntilEnded:ended", "<audio> ended event", {
+          currentTime: this.audio.currentTime,
+          duration: this.audio.duration,
+        });
+        // #endregion
+        cleanup();
+        resolve("ended");
+      };
+      const onPause = () => {
+        if (settled) return;
+        // pause 可能是：(1) duration 到达末尾后浏览器自动 pause（此时 ended=true）；
+        // (2) 外部 cancel() 调 audio.pause() 主动打断。用 ``ended`` 标志区分。
+        // #region agent log
+        _apdbg("audioPlayer.ts:waitUntilEnded:pause", "<audio> pause event", {
+          ended: this.audio.ended,
+          currentTime: this.audio.currentTime,
+          duration: this.audio.duration,
+        });
+        // #endregion
+        cleanup();
+        resolve(this.audio.ended ? "ended" : "cancelled");
+      };
+      const timer = setTimeout(() => {
+        if (settled) return;
+        // #region agent log
+        _apdbg("audioPlayer.ts:waitUntilEnded:timeout", "wait timed out", {
+          timeoutMs,
+          currentTime: this.audio.currentTime,
+          duration: this.audio.duration,
+          paused: this.audio.paused,
+          ended: this.audio.ended,
+        });
+        // #endregion
+        cleanup();
+        resolve("timeout");
+      }, timeoutMs);
+      this.audio.addEventListener("ended", onEnded);
+      this.audio.addEventListener("pause", onPause);
+    });
+  }
+
   /** 立即停止播放（用户打断 AI）。 */
   cancel(): void {
     try {

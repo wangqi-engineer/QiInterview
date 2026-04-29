@@ -59,3 +59,7 @@ debug-*.log
 e2e-*.log
 post-fix-*.log
 frontend-dev.log
+log_har*.txt
+
+# Qoder workspace (contains run logs)
+.qoder/

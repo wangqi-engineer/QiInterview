@@ -98,6 +98,10 @@ export default function InterviewPage() {
   const [error, setError] = useState("");
   const [ended, setEnded] = useState(false);
   const [endReason, setEndReason] = useState("");
+  // 进入面试页后弹窗要求先授权麦克风，micPrimed=true 才允许 WS
+  // 连接 + 发 start 触发开场。规避“先 TTS 后 STT 导致 STT 异常”的时序问题。
+  const [micPrimed, setMicPrimed] = useState(false);
+  const [primingMic, setPrimingMic] = useState(false);
 
   const wsRef = useRef<InterviewWS | null>(null);
   const captureRef = useRef<AudioCapture | null>(null);
@@ -120,6 +124,12 @@ export default function InterviewPage() {
   useEffect(() => {
     committedSttPrefixRef.current = committedSttPrefix;
   }, [committedSttPrefix]);
+  // v0.5：AudioCapture onSpeakingEnd 回调是闭包，拿不到最新 React state。
+  // 用 ref 同步 partial 值，供 VAD 自动定稿时读取当前草稿文字。
+  const partialRef = useRef<string>("");
+  useEffect(() => {
+    partialRef.current = partial;
+  }, [partial]);
 
   useEffect(() => {
     recordingRef.current = recording;
@@ -220,7 +230,8 @@ export default function InterviewPage() {
       ended,
     });
     // #endregion
-    if (!info || ended) return;
+    // micPrimed 之前不建立 WS：待用户在进面试弹窗里先点开麦才启动。
+    if (!info || ended || !micPrimed) return;
     const ws = new InterviewWS({
       sid,
       onEvent: handleEvent,
@@ -277,7 +288,7 @@ export default function InterviewPage() {
     // info 对象引用 → cleanup → 立刻重连，TTS 首字音频帧根本来不及到达前端，
     // 同时偶尔会让 user 的文本作答因恰逢半关闭窗口而被丢弃。
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [info?.id, ended]);
+  }, [info?.id, ended, micPrimed]);
 
   const handleEvent = async (ev: ServerEvent) => {
     switch (ev.type) {
@@ -289,6 +300,13 @@ export default function InterviewPage() {
           ...prev,
           { role: "interviewer", text: ev.text, strategy: ev.strategy },
         ]);
+        // v0.7：AI 每说一句自动服务器端 TTS，省去用户手动点「朗读 AI
+        // 最新一句」的操作。后端 opening / next_question / wrap_up 均走
+        // auto_tts=False（见 voice_ws.py::_drive_speech_stream），不会与此处重复。
+        // 保留按钮侜用于「重听」场景。
+        if (ev.text) {
+          speakAiText(ev.text);
+        }
         break;
       case "ai_audio":
         // D14 / VOICE-LATENCY-EAGER-FILLER-CACHE：``filler:true`` 帧（来自后端
@@ -322,14 +340,35 @@ export default function InterviewPage() {
         playerRef.current.appendBase64(ev.chunk_b64);
         setWaveState("speaking");
         break;
-      case "ai_audio_end":
-        playerRef.current?.endOfStream();
-        setTimeout(() => {
+      case "ai_audio_end": {
+        const player = playerRef.current;
+        if (!player) {
           setWaveState(micOnRef.current ? "listening" : "idle");
-          playerRef.current?.reset();
+          break;
+        }
+        // 打断场景（用户插话 / 后端主动 cancel_tts）：立即停，不等自然播完。
+        // 原逻辑用 setTimeout(200) 一刀切 reset，会把还在 SourceBuffer 里缓冲的
+        // 几秒音频连同 ``<audio>`` 一起 pause + endOfStream("decode")，导致开场白/
+        // next_question 这种较长文本听起来被掐掉。改为：先 endOfStream() 封口
+        // MSE，再 await ``<audio>`` 的 ``ended`` 事件，真的播完才 reset。
+        if (ev.interrupted) {
+          player.reset();
           playerRef.current = null;
-        }, 200);
+          setWaveState(micOnRef.current ? "listening" : "idle");
+          break;
+        }
+        player.endOfStream();
+        void player.waitUntilEnded().then(() => {
+          // 等待期间若已被新一轮 start()/reset() 换成别的 player 实例，则不要
+          // 动最新那个；只回收我们捕获到的这一段。
+          if (playerRef.current === player) {
+            player.reset();
+            playerRef.current = null;
+          }
+          setWaveState(micOnRef.current ? "listening" : "idle");
+        });
         break;
+      }
       case "stt_partial":
         // v0.4：partial 文字是当前这次录音的"草稿"，把它**追加**到
         // ``committedSttPrefix`` 之后写回 textarea。``prefix`` 在用户点
@@ -394,15 +433,7 @@ export default function InterviewPage() {
         });
         break;
       case "ai_interrupt":
-        setTurns((prev) => [
-          ...prev,
-          {
-            role: "interviewer",
-            text: `（打断）${ev.reason === "off_topic" ? "话题有点偏，我们先聚焦原问题。" : "时间关系，简明回答即可。"}`,
-            strategy: "interrupt",
-            interrupt: true,
-          },
-        ]);
+        // 后端仍会发这个信号（用于打分语义），但不再在会话框渲染提示气泡。
         break;
       case "interview_end":
         setEnded(true);
@@ -441,6 +472,30 @@ export default function InterviewPage() {
           if (!ws) return;
           const b64 = arrayBufferToBase64(f.pcm);
           ws.sendAudioFrame(b64);
+        },
+        // v0.5 / 用户合同：VAD 检测到本句说完（rmsSilenceMs 静音）时
+        // 自动把当前 partial 提升为 prefix，等价于用户虚拟地点了一下
+        // 「结束录音→开始录音」，但不断麦、不断 WS、不推进 AI。
+        // 关键：仅修改本地 prefix/partial state，不调 wsRef.endTurn() /
+        // wsRef.interrupt()，因此永远不会“打断 AI”或“被 VAD 提前 endTurn
+        // 抢话”，不破坏 i13/i16 协议级断言。
+        // 解决的现象：单次录音连说两句，第一句不会被第二句 partial 覆盖。
+        onSpeakingEnd: () => {
+          const cur = partialRef.current;
+          if (!cur) return;
+          const prefix = committedSttPrefixRef.current;
+          const merged = prefix
+            ? prefix.replace(/\s+$/u, "") + (prefix.endsWith("。") ? "" : " ") + cur
+            : cur;
+          committedSttPrefixRef.current = merged;
+          setCommittedSttPrefix(merged);
+          setPartial("");
+          // #region agent log
+          _dbg("InterviewPage.tsx:onSpeakingEnd", "VAD auto-commit partial to prefix", {
+            partialLen: cur.length,
+            newPrefixLen: merged.length,
+          });
+          // #endregion
         },
       });
       await cap.start();
@@ -516,6 +571,11 @@ export default function InterviewPage() {
     });
     // #endregion
     wsRef.current?.sendAnswerText(t);
+    // v0.5：提交本轮回答时把用户的这段话追加到右边对话历史。
+    // 之前 v0.4 重构把 stt_final 的 auto-append 拆掉迁移到这里，但漏了
+    // setTurns 这一步，导致用户提交后右边对话框看不到自己说的话；同时
+    // score_update 事件因为找不到 candidate turn 无法落地分数更新。
+    setTurns((prev) => [...prev, { role: "candidate", text: t }]);
     // v0.4：发送后重置 STT 累加 prefix；下一轮录音从空开始。
     committedSttPrefixRef.current = "";
     setCommittedSttPrefix("");
@@ -545,6 +605,51 @@ export default function InterviewPage() {
 
   return (
     <div className="grid lg:grid-cols-[420px_1fr] gap-6">
+      {/* 进入面试弹窗：先开麦再开始，规避“先 TTS 后 STT 异常”问题 */}
+      <AlertDialog open={!ended && !micPrimed}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>准备开始面试</AlertDialogTitle>
+            <AlertDialogDescription>
+              为保证语音识别稳定工作，请先授权并打开麦克风，再正式进入面试环节。
+              <br />
+              如果先播放 AI 语音再开麦，可能会导致 STT 无法正常识别。
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          {error && (
+            <div className="text-xs text-destructive">{error}</div>
+          )}
+          <AlertDialogFooter>
+            <Button
+              variant="outline"
+              onClick={() => nav(-1)}
+              disabled={primingMic}
+              data-testid="btn-prime-mic-cancel"
+            >
+              返回
+            </Button>
+            <Button
+              onClick={async () => {
+                setPrimingMic(true);
+                try {
+                  await startMic();
+                  // startMic 内部失败会 setError，captureRef.current 仍为 null
+                  if (captureRef.current) {
+                    setMicPrimed(true);
+                  }
+                } finally {
+                  setPrimingMic(false);
+                }
+              }}
+              disabled={primingMic}
+              data-testid="btn-prime-mic-confirm"
+            >
+              <Mic className="h-4 w-4 mr-2" />
+              {primingMic ? "正在开麦..." : "开启麦克风并开始面试"}
+            </Button>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
       {/* 左：状态 + 控制 */}
       <div className="space-y-4">
         <Card>
@@ -672,7 +777,17 @@ export default function InterviewPage() {
             <CardContent className="space-y-2">
               <Textarea
                 value={textAnswer}
-                onChange={(e) => setTextAnswer(e.target.value)}
+                onChange={(e) => {
+                  const v = e.target.value;
+                  setTextAnswer(v);
+                  // 用户手动编辑 textarea（含删除）时，必须把 prefix 同步到
+                  // textarea 的实际内容，并清掉还在识别中的 partial，否则
+                  // 下一次 stt_partial 到达会用旧 prefix 重新拼接，把用户
+                  // 刚删的内容又「冒回来」。
+                  committedSttPrefixRef.current = v;
+                  setCommittedSttPrefix(v);
+                  setPartial("");
+                }}
                 placeholder="如果不便使用麦克风，可以直接输入回答..."
                 rows={4}
                 data-testid="input-text-answer"
@@ -710,14 +825,8 @@ export default function InterviewPage() {
           {turns.map((t, i) => (
             <DialogBubble key={i} t={t} onSpeak={speakAiText} />
           ))}
-          {partial && (
-            <div className="flex justify-end">
-              <div className="rounded-lg bg-emerald-500/10 text-foreground px-3 py-2 max-w-[80%] text-sm border border-emerald-500/30">
-                <span className="text-emerald-700 text-xs mr-1">[识别中]</span>
-                {partial}
-              </div>
-            </div>
-          )}
+          {/* 识别中的 partial 文字只在左下 textarea 中显示，这里不再渲染
+              「[识别中] xxx」气泡，避免与已提交 turn 视觉混淆。 */}
         </CardContent>
       </Card>
 
