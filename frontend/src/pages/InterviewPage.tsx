@@ -82,6 +82,60 @@ const TYPE_LABEL: Record<string, string> = {
   hr: "HR 面",
 };
 
+// 句末强标点：中英文的句号/问号/感叹号。出现在 prefix 末尾时不再补分隔符。
+const SENT_END_RE = /[。！？.!?]$/u;
+// ASR 自动标点里偏保守的弱句末标点：逗号。做分隔时会被替换成"。"。
+const WEAK_END_RE = /[，,]$/u;
+
+// 在 prefix 末尾补一个"句号"作为 VAD 断点分隔符，返回"已带分隔符"的 prefix。
+//   - prefix 末尾已是 。！？ 等强句末标点 → 原样返回
+//   - prefix 末尾是 ASR 自动标点 "，/,"（弱句末）→ 把它替换成 "。"
+//   - 其它 → 直接在尾部补 "。"
+function appendSentenceBreak(prefix: string): string {
+  const trimmed = prefix.replace(/\s+$/u, "");
+  if (!trimmed) return trimmed;
+  if (SENT_END_RE.test(trimmed)) return trimmed;
+  if (WEAK_END_RE.test(trimmed)) return trimmed.slice(0, -1) + "。";
+  return trimmed + "。";
+}
+
+// ASR final 去重合并：火山 bigmodel_async 常常在短停顿触发一条 definite=true，
+// 拿到更长上下文后又推一条"包含前者"的更长 definite=true；若盲拼会得到
+// "老师你好，现在能 老师你好，现在能听到吗" 这种重复。这里做关系感知的合并：
+//   ① 新 final 以旧 prefix 为前缀（回头修正的超集）→ 覆盖
+//   ② 旧 prefix 尾部 与 新 final 头部 最长公共重叠 ≥ 2 字 → 去重后拼接
+//   ③ 完全独立的新一句 → VAD 断点处用 "。" 作为分隔符（由 appendSentenceBreak 处理）
+function mergeSttFinal(prefix: string, next: string): string {
+  const nRaw = (next ?? "").trim();
+  if (!nRaw) return prefix;
+  if (!prefix) return nRaw;
+
+  // 去掉 prefix 末尾的空格与中英句末标点，用于"包含 / 重叠"判断
+  const pBase = prefix.replace(/[\s。！？.!?]+$/u, "");
+  if (!pBase) return nRaw;
+
+  // ① 新文本以旧 prefix 开头（典型：回头修正把半句补全为整句）→ 覆盖
+  if (nRaw.startsWith(pBase)) {
+    return nRaw;
+  }
+
+  // ② 尾首最长重叠 ≥ 2 字 → 剔除重叠后拼接
+  const maxOverlap = Math.min(pBase.length, nRaw.length);
+  let overlap = 0;
+  for (let k = maxOverlap; k >= 2; k--) {
+    if (pBase.endsWith(nRaw.slice(0, k))) {
+      overlap = k;
+      break;
+    }
+  }
+  if (overlap > 0) {
+    return pBase + nRaw.slice(overlap);
+  }
+
+  // ③ 独立新一句：VAD 断点处用 "。" 分隔（替代旧版空格）
+  return appendSentenceBreak(prefix) + nRaw;
+}
+
 export default function InterviewPage() {
   const { sid = "" } = useParams<{ sid: string }>();
   const nav = useNavigate();
@@ -374,12 +428,11 @@ export default function InterviewPage() {
         // ``committedSttPrefix`` 之后写回 textarea。``prefix`` 在用户点
         // [开始录音]→[结束录音] 时累积，[发送本轮回答] 后才清空。这样
         // 同一轮里多次开/停录音不会丢前面已说过的话。
+        // VAD 断点分隔统一用 "。"（替代旧版空格），与 stt_final 保持一致。
         setPartial(ev.text);
         if (ev.text) {
           const prefix = committedSttPrefixRef.current;
-          const merged = prefix
-            ? prefix.replace(/\s+$/u, "") + (prefix.endsWith("。") ? "" : " ") + ev.text
-            : ev.text;
+          const merged = prefix ? appendSentenceBreak(prefix) + ev.text : ev.text;
           setTextAnswer(merged);
         }
         // #region agent log
@@ -394,11 +447,11 @@ export default function InterviewPage() {
         // 在新合同里也不会自动 _on_user_final、不会推 next_question。final 文本
         // 落到 textarea 与 ``committedSttPrefix``，让用户确认 / 编辑后手动点
         // [发送本轮回答]。同一轮里多次开/停录音都会被并入 prefix。
+        //
+        // 关系感知 merge：解决火山 ASR "先推半句 final，再推完整句 final" 导致的
+        // 盲拼重复（例："老师你好，现在能 老师你好，现在能听到吗"）。
         if (ev.text) {
-          const prefix = committedSttPrefixRef.current;
-          const merged = prefix
-            ? prefix.replace(/\s+$/u, "") + (prefix.endsWith("。") ? "" : " ") + ev.text
-            : ev.text;
+          const merged = mergeSttFinal(committedSttPrefixRef.current, ev.text);
           setTextAnswer(merged);
           // final 等于本次开/停录音的最终结果——把它合入 prefix，下一次开
           // 录音时 partial 会接在它之后。
