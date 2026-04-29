@@ -1,0 +1,61 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+ENV/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Node
+node_modules/
+dist/
+.vite/
+*.log
+
+# Env
+.env
+.env.local
+.env.*.local
+
+# DB
+*.db
+*.db-journal
+backend/data/
+
+# IDE
+.vscode/
+.idea/
+.DS_Store
+
+# Build
+build/
+*.tsbuildinfo
+
+# Logs
+logs/
+*.log
+
+# Audio cache
+backend/audio_cache/
+
+# Tests
+tests/
+
+# Cursor IDE workspace (contains debug logs)
+.cursor/
+
+# Virtual envs (e2e)
+.venv-e2e*/
+
+# Root-level debug / run logs
+debug-*.log
+e2e-*.log
+post-fix-*.log
+frontend-dev.log

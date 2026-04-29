@@ -1,0 +1,35 @@
+基于完整面试记录与起始印象分依据，生成一份完整的复盘报告。
+
+# 候选人简历摘要
+{{ resume_text[:1500] if resume_text else "（无简历）" }}
+
+# 岗位
+{{ job_title }}
+
+# 起始印象分（{{ initial_score }}/100）—— 5 维拆解
+{% if breakdown %}
+{% for k, v in breakdown.items() %}
+- **{{ k }}**：{{ v.score }}/10 —— {{ v.reason }}
+{% endfor %}
+{% else %}
+（未计算 breakdown）
+{% endif %}
+
+# 面试逐轮记录
+{% for t in turns %}
+- 第{{ t.idx }}轮 [{{ t.role }}] (delta {{ t.score_delta|default(0) }} → {{ t.score_after|default("?") }})：
+  {{ t.text[:400] }}
+{% endfor %}
+
+# 最终得分：{{ final_score }} / 100
+# 结束原因：{{ end_reason }}
+
+请输出严格 JSON（不要 markdown 代码块包裹），其中 score_explanation_md 必须把"为什么是这个分"讲清楚——既包括起始印象分的 5 维依据，也包括面试过程中具体哪些回答让分数上下浮动。
+
+{
+  "summary": "<整体表现总结，2-3 句>",
+  "strengths_md": "<亮点 markdown 列表，至少 3 项；引用具体回答内容>",
+  "weaknesses_md": "<不足 markdown 列表，至少 3 项；引用具体回答内容>",
+  "advice_md": "<针对性提升建议 markdown 列表，至少 3 项>",
+  "score_explanation_md": "<得分解读 markdown：先复述印象分 5 维（学校/经验/项目/产出/匹配度）的简明理由，再说明面试过程中第几轮的哪个回答带来 +/- 多少分，最终落到 {{ final_score }} 分的逻辑链。至少 6 行。>"
+}
