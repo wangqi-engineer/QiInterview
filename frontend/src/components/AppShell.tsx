@@ -1,20 +1,9 @@
-import { useEffect, useState } from "react";
+import { useEffect } from "react";
 import { NavLink, useLocation, useNavigate } from "react-router-dom";
 import { cn } from "@/lib/utils";
 import { Brain, History, LogOut, Settings2, User } from "lucide-react";
 import { useAuth } from "@/store/auth";
 import { Button } from "@/components/ui/button";
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from "@/components/ui/alert-dialog";
-import { apiClient } from "@/lib/api";
 
 export function AppShell({ children }: { children: React.ReactNode }) {
   const linkCls = ({ isActive }: { isActive: boolean }) =>
@@ -44,53 +33,9 @@ export function AppShell({ children }: { children: React.ReactNode }) {
     location.pathname.startsWith("/login") ||
     location.pathname.startsWith("/register");
 
-  // 面试进行中，拦截「预约 / 历史 / 登出」的跳转，先弹窗确认是否结束面试。
-  const interviewMatch = location.pathname.match(/^\/interview\/([^/]+)$/);
-  const inInterview = !!interviewMatch;
-  const sidInInterview = interviewMatch?.[1];
-  type PendingNav = { kind: "path"; to: string } | { kind: "logout" };
-  const [pendingNav, setPendingNav] = useState<PendingNav | null>(null);
-  const [leaving, setLeaving] = useState(false);
-
   const onLogout = async () => {
     await logout();
     nav("/login", { replace: true });
-  };
-
-  const requestNavPath = (to: string) => (e: React.MouseEvent) => {
-    if (inInterview) {
-      e.preventDefault();
-      setPendingNav({ kind: "path", to });
-    }
-    // 非面试页 NavLink 自行完成跳转
-  };
-
-  const requestLogout = () => {
-    if (inInterview) {
-      setPendingNav({ kind: "logout" });
-      return;
-    }
-    void onLogout();
-  };
-
-  const confirmLeave = async () => {
-    const p = pendingNav;
-    if (!p) return;
-    setLeaving(true);
-    if (sidInInterview) {
-      try {
-        await apiClient.endInterview(sidInInterview, "user");
-      } catch {
-        /* 幂等失败（已结束等）按按钮跳转即可 */
-      }
-    }
-    setLeaving(false);
-    setPendingNav(null);
-    if (p.kind === "logout") {
-      await onLogout();
-    } else {
-      nav(p.to);
-    }
   };
 
   return (
@@ -109,11 +54,11 @@ export function AppShell({ children }: { children: React.ReactNode }) {
           <nav className="flex items-center gap-1">
             {!isPublic && me && (
               <>
-                <NavLink to="/setup" className={linkCls} onClick={requestNavPath("/setup")}>
+                <NavLink to="/setup" className={linkCls}>
                   <Settings2 className="h-4 w-4" />
                   预约
                 </NavLink>
-                <NavLink to="/history" className={linkCls} onClick={requestNavPath("/history")}>
+                <NavLink to="/history" className={linkCls}>
                   <History className="h-4 w-4" />
                   历史
                 </NavLink>
@@ -128,7 +73,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
                 <Button
                   variant="ghost"
                   size="sm"
-                  onClick={requestLogout}
+                  onClick={onLogout}
                   data-testid="btn-logout"
                   title="登出"
                 >
@@ -140,35 +85,6 @@ export function AppShell({ children }: { children: React.ReactNode }) {
         </div>
       </header>
       <main className="container flex-1 py-8">{children}</main>
-      {/* 面试进行中拦截顶栏跳转：确认后调 endInterview + 跳转目标页面 */}
-      <AlertDialog
-        open={!!pendingNav}
-        onOpenChange={(open) => {
-          if (!open && !leaving) setPendingNav(null);
-        }}
-      >
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>结束当前面试？</AlertDialogTitle>
-            <AlertDialogDescription>
-              跳转前会结束当前面试并生成复盘报告，结束后将无法继续本轮对话。确定继续吗？
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel disabled={leaving}>取消</AlertDialogCancel>
-            <AlertDialogAction
-              onClick={(e) => {
-                e.preventDefault();
-                void confirmLeave();
-              }}
-              disabled={leaving}
-              data-testid="btn-confirm-leave-interview"
-            >
-              {leaving ? "正在结束..." : "是，结束面试"}
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
     </div>
   );
 }

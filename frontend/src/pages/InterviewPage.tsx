@@ -82,60 +82,6 @@ const TYPE_LABEL: Record<string, string> = {
   hr: "HR 面",
 };
 
-// 句末强标点：中英文的句号/问号/感叹号。出现在 prefix 末尾时不再补分隔符。
-const SENT_END_RE = /[。！？.!?]$/u;
-// ASR 自动标点里偏保守的弱句末标点：逗号。做分隔时会被替换成"。"。
-const WEAK_END_RE = /[，,]$/u;
-
-// 在 prefix 末尾补一个"句号"作为 VAD 断点分隔符，返回"已带分隔符"的 prefix。
-//   - prefix 末尾已是 。！？ 等强句末标点 → 原样返回
-//   - prefix 末尾是 ASR 自动标点 "，/,"（弱句末）→ 把它替换成 "。"
-//   - 其它 → 直接在尾部补 "。"
-function appendSentenceBreak(prefix: string): string {
-  const trimmed = prefix.replace(/\s+$/u, "");
-  if (!trimmed) return trimmed;
-  if (SENT_END_RE.test(trimmed)) return trimmed;
-  if (WEAK_END_RE.test(trimmed)) return trimmed.slice(0, -1) + "。";
-  return trimmed + "。";
-}
-
-// ASR final 去重合并：火山 bigmodel_async 常常在短停顿触发一条 definite=true，
-// 拿到更长上下文后又推一条"包含前者"的更长 definite=true；若盲拼会得到
-// "老师你好，现在能 老师你好，现在能听到吗" 这种重复。这里做关系感知的合并：
-//   ① 新 final 以旧 prefix 为前缀（回头修正的超集）→ 覆盖
-//   ② 旧 prefix 尾部 与 新 final 头部 最长公共重叠 ≥ 2 字 → 去重后拼接
-//   ③ 完全独立的新一句 → VAD 断点处用 "。" 作为分隔符（由 appendSentenceBreak 处理）
-function mergeSttFinal(prefix: string, next: string): string {
-  const nRaw = (next ?? "").trim();
-  if (!nRaw) return prefix;
-  if (!prefix) return nRaw;
-
-  // 去掉 prefix 末尾的空格与中英句末标点，用于"包含 / 重叠"判断
-  const pBase = prefix.replace(/[\s。！？.!?]+$/u, "");
-  if (!pBase) return nRaw;
-
-  // ① 新文本以旧 prefix 开头（典型：回头修正把半句补全为整句）→ 覆盖
-  if (nRaw.startsWith(pBase)) {
-    return nRaw;
-  }
-
-  // ② 尾首最长重叠 ≥ 2 字 → 剔除重叠后拼接
-  const maxOverlap = Math.min(pBase.length, nRaw.length);
-  let overlap = 0;
-  for (let k = maxOverlap; k >= 2; k--) {
-    if (pBase.endsWith(nRaw.slice(0, k))) {
-      overlap = k;
-      break;
-    }
-  }
-  if (overlap > 0) {
-    return pBase + nRaw.slice(overlap);
-  }
-
-  // ③ 独立新一句：VAD 断点处用 "。" 分隔（替代旧版空格）
-  return appendSentenceBreak(prefix) + nRaw;
-}
-
 export default function InterviewPage() {
   const { sid = "" } = useParams<{ sid: string }>();
   const nav = useNavigate();
@@ -152,10 +98,6 @@ export default function InterviewPage() {
   const [error, setError] = useState("");
   const [ended, setEnded] = useState(false);
   const [endReason, setEndReason] = useState("");
-  // 进入面试页后弹窗要求先授权麦克风，micPrimed=true 才允许 WS
-  // 连接 + 发 start 触发开场。规避“先 TTS 后 STT 导致 STT 异常”的时序问题。
-  const [micPrimed, setMicPrimed] = useState(false);
-  const [primingMic, setPrimingMic] = useState(false);
 
   const wsRef = useRef<InterviewWS | null>(null);
   const captureRef = useRef<AudioCapture | null>(null);
@@ -178,12 +120,6 @@ export default function InterviewPage() {
   useEffect(() => {
     committedSttPrefixRef.current = committedSttPrefix;
   }, [committedSttPrefix]);
-  // v0.5：AudioCapture onSpeakingEnd 回调是闭包，拿不到最新 React state。
-  // 用 ref 同步 partial 值，供 VAD 自动定稿时读取当前草稿文字。
-  const partialRef = useRef<string>("");
-  useEffect(() => {
-    partialRef.current = partial;
-  }, [partial]);
 
   useEffect(() => {
     recordingRef.current = recording;
@@ -284,8 +220,7 @@ export default function InterviewPage() {
       ended,
     });
     // #endregion
-    // micPrimed 之前不建立 WS：待用户在进面试弹窗里先点开麦才启动。
-    if (!info || ended || !micPrimed) return;
+    if (!info || ended) return;
     const ws = new InterviewWS({
       sid,
       onEvent: handleEvent,
@@ -342,7 +277,7 @@ export default function InterviewPage() {
     // info 对象引用 → cleanup → 立刻重连，TTS 首字音频帧根本来不及到达前端，
     // 同时偶尔会让 user 的文本作答因恰逢半关闭窗口而被丢弃。
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [info?.id, ended, micPrimed]);
+  }, [info?.id, ended]);
 
   const handleEvent = async (ev: ServerEvent) => {
     switch (ev.type) {
@@ -354,13 +289,6 @@ export default function InterviewPage() {
           ...prev,
           { role: "interviewer", text: ev.text, strategy: ev.strategy },
         ]);
-        // v0.7：AI 每说一句自动服务器端 TTS，省去用户手动点「朗读 AI
-        // 最新一句」的操作。后端 opening / next_question / wrap_up 均走
-        // auto_tts=False（见 voice_ws.py::_drive_speech_stream），不会与此处重复。
-        // 保留按钮侜用于「重听」场景。
-        if (ev.text) {
-          speakAiText(ev.text);
-        }
         break;
       case "ai_audio":
         // D14 / VOICE-LATENCY-EAGER-FILLER-CACHE：``filler:true`` 帧（来自后端
@@ -394,45 +322,25 @@ export default function InterviewPage() {
         playerRef.current.appendBase64(ev.chunk_b64);
         setWaveState("speaking");
         break;
-      case "ai_audio_end": {
-        const player = playerRef.current;
-        if (!player) {
+      case "ai_audio_end":
+        playerRef.current?.endOfStream();
+        setTimeout(() => {
           setWaveState(micOnRef.current ? "listening" : "idle");
-          break;
-        }
-        // 打断场景（用户插话 / 后端主动 cancel_tts）：立即停，不等自然播完。
-        // 原逻辑用 setTimeout(200) 一刀切 reset，会把还在 SourceBuffer 里缓冲的
-        // 几秒音频连同 ``<audio>`` 一起 pause + endOfStream("decode")，导致开场白/
-        // next_question 这种较长文本听起来被掐掉。改为：先 endOfStream() 封口
-        // MSE，再 await ``<audio>`` 的 ``ended`` 事件，真的播完才 reset。
-        if (ev.interrupted) {
-          player.reset();
+          playerRef.current?.reset();
           playerRef.current = null;
-          setWaveState(micOnRef.current ? "listening" : "idle");
-          break;
-        }
-        player.endOfStream();
-        void player.waitUntilEnded().then(() => {
-          // 等待期间若已被新一轮 start()/reset() 换成别的 player 实例，则不要
-          // 动最新那个；只回收我们捕获到的这一段。
-          if (playerRef.current === player) {
-            player.reset();
-            playerRef.current = null;
-          }
-          setWaveState(micOnRef.current ? "listening" : "idle");
-        });
+        }, 200);
         break;
-      }
       case "stt_partial":
         // v0.4：partial 文字是当前这次录音的"草稿"，把它**追加**到
         // ``committedSttPrefix`` 之后写回 textarea。``prefix`` 在用户点
         // [开始录音]→[结束录音] 时累积，[发送本轮回答] 后才清空。这样
         // 同一轮里多次开/停录音不会丢前面已说过的话。
-        // VAD 断点分隔统一用 "。"（替代旧版空格），与 stt_final 保持一致。
         setPartial(ev.text);
         if (ev.text) {
           const prefix = committedSttPrefixRef.current;
-          const merged = prefix ? appendSentenceBreak(prefix) + ev.text : ev.text;
+          const merged = prefix
+            ? prefix.replace(/\s+$/u, "") + (prefix.endsWith("。") ? "" : " ") + ev.text
+            : ev.text;
           setTextAnswer(merged);
         }
         // #region agent log
@@ -447,11 +355,11 @@ export default function InterviewPage() {
         // 在新合同里也不会自动 _on_user_final、不会推 next_question。final 文本
         // 落到 textarea 与 ``committedSttPrefix``，让用户确认 / 编辑后手动点
         // [发送本轮回答]。同一轮里多次开/停录音都会被并入 prefix。
-        //
-        // 关系感知 merge：解决火山 ASR "先推半句 final，再推完整句 final" 导致的
-        // 盲拼重复（例："老师你好，现在能 老师你好，现在能听到吗"）。
         if (ev.text) {
-          const merged = mergeSttFinal(committedSttPrefixRef.current, ev.text);
+          const prefix = committedSttPrefixRef.current;
+          const merged = prefix
+            ? prefix.replace(/\s+$/u, "") + (prefix.endsWith("。") ? "" : " ") + ev.text
+            : ev.text;
           setTextAnswer(merged);
           // final 等于本次开/停录音的最终结果——把它合入 prefix，下一次开
           // 录音时 partial 会接在它之后。
@@ -486,7 +394,15 @@ export default function InterviewPage() {
         });
         break;
       case "ai_interrupt":
-        // 后端仍会发这个信号（用于打分语义），但不再在会话框渲染提示气泡。
+        setTurns((prev) => [
+          ...prev,
+          {
+            role: "interviewer",
+            text: `（打断）${ev.reason === "off_topic" ? "话题有点偏，我们先聚焦原问题。" : "时间关系，简明回答即可。"}`,
+            strategy: "interrupt",
+            interrupt: true,
+          },
+        ]);
         break;
       case "interview_end":
         setEnded(true);
@@ -525,30 +441,6 @@ export default function InterviewPage() {
           if (!ws) return;
           const b64 = arrayBufferToBase64(f.pcm);
           ws.sendAudioFrame(b64);
-        },
-        // v0.5 / 用户合同：VAD 检测到本句说完（rmsSilenceMs 静音）时
-        // 自动把当前 partial 提升为 prefix，等价于用户虚拟地点了一下
-        // 「结束录音→开始录音」，但不断麦、不断 WS、不推进 AI。
-        // 关键：仅修改本地 prefix/partial state，不调 wsRef.endTurn() /
-        // wsRef.interrupt()，因此永远不会“打断 AI”或“被 VAD 提前 endTurn
-        // 抢话”，不破坏 i13/i16 协议级断言。
-        // 解决的现象：单次录音连说两句，第一句不会被第二句 partial 覆盖。
-        onSpeakingEnd: () => {
-          const cur = partialRef.current;
-          if (!cur) return;
-          const prefix = committedSttPrefixRef.current;
-          const merged = prefix
-            ? prefix.replace(/\s+$/u, "") + (prefix.endsWith("。") ? "" : " ") + cur
-            : cur;
-          committedSttPrefixRef.current = merged;
-          setCommittedSttPrefix(merged);
-          setPartial("");
-          // #region agent log
-          _dbg("InterviewPage.tsx:onSpeakingEnd", "VAD auto-commit partial to prefix", {
-            partialLen: cur.length,
-            newPrefixLen: merged.length,
-          });
-          // #endregion
         },
       });
       await cap.start();
@@ -624,11 +516,6 @@ export default function InterviewPage() {
     });
     // #endregion
     wsRef.current?.sendAnswerText(t);
-    // v0.5：提交本轮回答时把用户的这段话追加到右边对话历史。
-    // 之前 v0.4 重构把 stt_final 的 auto-append 拆掉迁移到这里，但漏了
-    // setTurns 这一步，导致用户提交后右边对话框看不到自己说的话；同时
-    // score_update 事件因为找不到 candidate turn 无法落地分数更新。
-    setTurns((prev) => [...prev, { role: "candidate", text: t }]);
     // v0.4：发送后重置 STT 累加 prefix；下一轮录音从空开始。
     committedSttPrefixRef.current = "";
     setCommittedSttPrefix("");
@@ -658,51 +545,6 @@ export default function InterviewPage() {
 
   return (
     <div className="grid lg:grid-cols-[420px_1fr] gap-6">
-      {/* 进入面试弹窗：先开麦再开始，规避“先 TTS 后 STT 异常”问题 */}
-      <AlertDialog open={!ended && !micPrimed}>
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>准备开始面试</AlertDialogTitle>
-            <AlertDialogDescription>
-              为保证语音识别稳定工作，请先授权并打开麦克风，再正式进入面试环节。
-              <br />
-              如果先播放 AI 语音再开麦，可能会导致 STT 无法正常识别。
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          {error && (
-            <div className="text-xs text-destructive">{error}</div>
-          )}
-          <AlertDialogFooter>
-            <Button
-              variant="outline"
-              onClick={() => nav(-1)}
-              disabled={primingMic}
-              data-testid="btn-prime-mic-cancel"
-            >
-              返回
-            </Button>
-            <Button
-              onClick={async () => {
-                setPrimingMic(true);
-                try {
-                  await startMic();
-                  // startMic 内部失败会 setError，captureRef.current 仍为 null
-                  if (captureRef.current) {
-                    setMicPrimed(true);
-                  }
-                } finally {
-                  setPrimingMic(false);
-                }
-              }}
-              disabled={primingMic}
-              data-testid="btn-prime-mic-confirm"
-            >
-              <Mic className="h-4 w-4 mr-2" />
-              {primingMic ? "正在开麦..." : "开启麦克风并开始面试"}
-            </Button>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
       {/* 左：状态 + 控制 */}
       <div className="space-y-4">
         <Card>
@@ -830,17 +672,7 @@ export default function InterviewPage() {
             <CardContent className="space-y-2">
               <Textarea
                 value={textAnswer}
-                onChange={(e) => {
-                  const v = e.target.value;
-                  setTextAnswer(v);
-                  // 用户手动编辑 textarea（含删除）时，必须把 prefix 同步到
-                  // textarea 的实际内容，并清掉还在识别中的 partial，否则
-                  // 下一次 stt_partial 到达会用旧 prefix 重新拼接，把用户
-                  // 刚删的内容又「冒回来」。
-                  committedSttPrefixRef.current = v;
-                  setCommittedSttPrefix(v);
-                  setPartial("");
-                }}
+                onChange={(e) => setTextAnswer(e.target.value)}
                 placeholder="如果不便使用麦克风，可以直接输入回答..."
                 rows={4}
                 data-testid="input-text-answer"
@@ -878,8 +710,14 @@ export default function InterviewPage() {
           {turns.map((t, i) => (
             <DialogBubble key={i} t={t} onSpeak={speakAiText} />
           ))}
-          {/* 识别中的 partial 文字只在左下 textarea 中显示，这里不再渲染
-              「[识别中] xxx」气泡，避免与已提交 turn 视觉混淆。 */}
+          {partial && (
+            <div className="flex justify-end">
+              <div className="rounded-lg bg-emerald-500/10 text-foreground px-3 py-2 max-w-[80%] text-sm border border-emerald-500/30">
+                <span className="text-emerald-700 text-xs mr-1">[识别中]</span>
+                {partial}
+              </div>
+            </div>
+          )}
         </CardContent>
       </Card>
 
