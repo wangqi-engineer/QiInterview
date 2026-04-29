@@ -1,0 +1,32 @@
+基于以下信息，决定下一个问题。
+
+# 候选人简历摘要
+{{ resume_text[:1500] if resume_text else "（候选人未上传简历，请基于岗位 JD 提问）" }}
+
+# 岗位 JD
+标题：{{ job_title }}
+{{ job_jd[:1500] if job_jd else "" }}
+
+# 历史问答（最近 {{ history|length }} 轮）
+{% for h in history %}
+- 第{{ h.idx }}轮 [{{ h.role }}]: {{ h.text[:300] }}
+{% endfor %}
+
+# 当前评分
+- 累计得分：{{ current_score }}（满分 100）
+- 评分阈值：{{ threshold }}（低于此值需要委婉收尾）
+
+# 你的任务
+判断当前应该：
+- "breadth"：换一个新方向，考察知识面；
+- "depth"：基于上一轮回答继续追问，考察深度；
+- "wrap_up"：累计得分过低或已问到第 {{ max_rounds }} 轮，进入收尾。
+
+输出严格 JSON（不要任何 markdown 代码块包裹），字段顺序**必须**和下面一致——
+``speech`` 必须排在第一个字段，否则前端无法尽早开始 TTS 朗读，会造成
+明显延迟：
+{
+  "speech": "<面试官原话，第一人称，不要重复对方的话，直接问；50 字以内最好>",
+  "strategy": "breadth" | "depth" | "wrap_up",
+  "expected_topic": "<本题考察的知识点，简短一句>"
+}
