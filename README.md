@@ -14,7 +14,7 @@ flowchart LR
     AW[AudioWorklet 16k PCM]
     MS[MediaSource 播放 mp3]
   end
-  UI <-- WebSocket --> WS[/FastAPI /ws/interview/{sid}/]
+  UI <-- WebSocket --> WS[/FastAPI /ws/interview/sid/]
   UI <-- REST --> API[/FastAPI /api/.../]
   WS --> ENG[Interviewer Engine]
   ENG --> LLM[OpenAI SDK\n（doubao/deepseek/qwen/glm）]
