@@ -316,8 +316,6 @@ pytest tests/e2e/test_e2e_qiinterview.py -v -s
 - **语音供应商**：绑定火山引擎（新接口 `unidirectional` + `bigmodel_async`），更换 TTS/STT 供应商需改 `services/tts.py` 与 `services/stt.py`
 - **LLM 供应商**：通过 OpenAI SDK `base_url` 切换；新增供应商需确保其 Chat Completions 兼容
 - **实时评分**：依赖 LLM 稳定返回 JSON，历史实现过 JSON 解析降级但不保证 100% 成功
-- **语音延迟**：端到端（用户停说 → AI 声音出来）目标 <1s，实测受 LLM 与 TTS 首块影响通常 1.5–3s，README_TEST 里标记为"产品真实性能缺陷"而非测试问题
-
 ---
 
 Powered by Volcengine Doubao &amp; Speech · v0.4
