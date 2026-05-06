@@ -315,7 +315,6 @@ pytest tests/e2e/test_e2e_qiinterview.py -v -s
 - **岗位来源**：仅腾讯 / 字节 / 阿里三家官网接口，其它公司需自行实现 `services/jobs/` 下的 `BaseFetcher`
 - **语音供应商**：绑定火山引擎（新接口 `unidirectional` + `bigmodel_async`），更换 TTS/STT 供应商需改 `services/tts.py` 与 `services/stt.py`
 - **LLM 供应商**：通过 OpenAI SDK `base_url` 切换；新增供应商需确保其 Chat Completions 兼容
-- **实时评分**：依赖 LLM 稳定返回 JSON，历史实现过 JSON 解析降级但不保证 100% 成功
 ---
 
 Powered by Volcengine Doubao &amp; Speech · v0.4
